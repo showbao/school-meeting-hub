@@ -1,6 +1,6 @@
-# Version: v2.2 (ID-Based Locking)
+# Version: v2.3 (Smart Caching)
 # Author: CTO (Gemini)
-# Description: 改用 Sheet ID 強制鎖定試算表，排除檔名誤差
+# Description: 加入快取機制 (Cache) 解決 429 API Quota 流量限制問題
 
 import streamlit as st
 import pandas as pd
@@ -18,7 +18,7 @@ import time
 # 【請填入 GAS 網址】
 GAS_UPLOAD_URL = "https://script.google.com/macros/s/AKfycbzre2cPuoiie16hiFW1Dto1xFgnvPTqtM3O9u97Ja1qdWoGlSbZ7PEQ8X6rBh_tNpOB/exec"
 
-# 【請填入 Google Sheet ID】(網址 d/ 和 /edit 中間那串)
+# 【請填入 Google Sheet ID】
 SHEET_ID = "1bX4webOXnQ65dNtjAS7Iuo78gRB8GWBKvm03Vif72hM"
 
 SCOPE = [
@@ -31,7 +31,7 @@ SCOPE = [
 
 @st.cache_resource
 def init_connection():
-    """連線到 Google Sheets"""
+    """連線到 Google Sheets (連線物件快取)"""
     creds = None
     if "gcp_service_account" in st.secrets:
         creds_dict = st.secrets["gcp_service_account"]
@@ -44,11 +44,18 @@ def init_connection():
     
     return gspread.authorize(creds)
 
-def get_data(gc):
-    """讀取 Google Sheet 資料 (使用 ID 鎖定)"""
+def get_sh(gc):
+    """取得試算表物件 (不快取，確保寫入時是新的)"""
     try:
-        # v2.2 修改：改用 ID 開啟，絕對精準
-        sh = gc.open_by_key(SHEET_ID)
+        return gc.open_by_key(SHEET_ID)
+    except Exception as e:
+        return None
+
+@st.cache_data(ttl=60)  # <--- 關鍵修改：加入快取，60秒內不會重複讀取 API
+def load_data_frames(_gc):
+    """讀取資料並轉為 DataFrame (快取 60 秒)"""
+    try:
+        sh = _gc.open_by_key(SHEET_ID)
         
         ws_config = sh.worksheet("config")
         df_config = pd.DataFrame(ws_config.get_all_records())
@@ -56,11 +63,9 @@ def get_data(gc):
         ws_records = sh.worksheet("records")
         df_records = pd.DataFrame(ws_records.get_all_records())
         
-        return sh, df_config, df_records
+        return df_config, df_records
     except Exception as e:
-        # 如果還是失敗，我們會把錯誤印出來
-        st.error(f"【嚴重錯誤】無法開啟試算表。錯誤訊息: {e}")
-        return None, None, None
+        return None, None
 
 def upload_file_via_gas(file_obj):
     """透過 GAS 中繼站上傳檔案"""
@@ -97,27 +102,20 @@ def upload_file_via_gas(file_obj):
 def main():
     st.set_page_config(page_title="校務會議看板", layout="wide", page_icon="🏫")
     
-    # 診斷資訊：顯示機器人 Email (方便除錯)
-    if "gcp_service_account" in st.secrets:
-        bot_email = st.secrets["gcp_service_account"]["client_email"]
-        # st.caption(f"🔧 System Diagnosis: Bot Email is [{bot_email}]") 
-        # ↑ 如果連線成功，建議將上行註解掉，以免暴露資訊
-
+    # 1. 建立連線
     gc = init_connection()
     if gc is None:
         st.error("❌ 系統連線失敗：Secrets 設定有誤。")
         return
 
-    sh, df_config, df_records = get_data(gc)
+    # 2. 讀取資料 (使用快取)
+    df_config, df_records = load_data_frames(gc)
     
-    # 如果 sh 是 None，代表 ID 錯誤或是機器人真的沒權限
-    if sh is None:
-        st.warning(f"請再次確認：\n1. 您的 Google Sheet ID 是否正確填入程式碼？\n2. 是否已將機器人加入試算表共用？")
-        if "gcp_service_account" in st.secrets:
-            st.code(f"請複製此機器人 Email 加入共用：\n{st.secrets['gcp_service_account']['client_email']}")
+    if df_config is None:
+        st.error("❌ 無法讀取資料，請稍後再試 (API 冷卻中) 或檢查 Sheet ID。")
         return
 
-    # --- 以下邏輯不變 ---
+    # 3. 初始化 Session State
     if 'logged_in' not in st.session_state:
         st.session_state.logged_in = False
     if 'user_info' not in st.session_state:
@@ -125,8 +123,10 @@ def main():
     if 'cart' not in st.session_state:
         st.session_state.cart = [] 
 
+    # --- 側邊欄 ---
     with st.sidebar:
         st.title("🏫 功能選單")
+        
         if not st.session_state.logged_in:
             st.subheader("使用者登入")
             if df_config.empty:
@@ -134,16 +134,20 @@ def main():
             else:
                 dept_list = df_config['department'].unique().tolist()
                 selected_dept = st.selectbox("選擇處室", dept_list)
+                
                 groups_in_dept = df_config[df_config['department'] == selected_dept]['group'].tolist()
                 selected_group = st.selectbox("選擇組別", groups_in_dept)
+                
                 password = st.text_input("密碼", type="password")
                 
                 if st.button("登入"):
+                    # 這裡使用快取的 df_config 進行驗證，不消耗 API
                     valid_user = df_config[
                         (df_config['department'] == selected_dept) & 
                         (df_config['group'] == selected_group) & 
                         (df_config['password'].astype(str) == str(password))
                     ]
+                    
                     if not valid_user.empty:
                         st.session_state.logged_in = True
                         st.session_state.user_info = {'dept': selected_dept, 'group': selected_group}
@@ -160,10 +164,16 @@ def main():
                 st.session_state.cart = []
                 st.rerun()
 
+    # --- 主畫面 ---
     tab1, tab2 = st.tabs(["📋 看板", "📝 繕打"])
 
+    # === Tab 1: 看板 ===
     with tab1:
         st.header("每週會議紀錄彙整")
+        if st.button("🔄 重新整理資料"):
+            st.cache_data.clear() # 手動清除快取
+            st.rerun()
+
         if not df_records.empty:
             df_records['meeting_date'] = pd.to_datetime(df_records['meeting_date']).dt.date
             all_dates = sorted(df_records['meeting_date'].unique(), reverse=True)
@@ -171,6 +181,7 @@ def main():
             st.divider()
             
             daily_records = df_records[df_records['meeting_date'] == selected_date]
+            
             if daily_records.empty:
                 st.info("該日期無紀錄")
             else:
@@ -178,6 +189,7 @@ def main():
                 for dept in departments:
                     st.subheader(f"📂 {dept}")
                     dept_data = daily_records[daily_records['department'] == dept]
+                    
                     for idx, row in dept_data.iterrows():
                         with st.expander(f"{row['group']} - {str(row['content'])[:20]}...", expanded=True):
                             st.markdown(f"**報告內容：**\n{row['content']}")
@@ -187,11 +199,13 @@ def main():
         else:
             st.info("尚無紀錄")
 
+    # === Tab 2: 繕打 ===
     with tab2:
         if not st.session_state.logged_in:
             st.warning("請先登入")
         else:
             st.header(f"新增報告 - {st.session_state.user_info['group']}")
+            
             col_d, _ = st.columns([1,2])
             with col_d:
                 meeting_date = st.date_input("會議日期")
@@ -225,31 +239,46 @@ def main():
                     if st.button("🚀 確認送出", type="primary"):
                         progress_bar = st.progress(0)
                         status_text = st.empty()
+                        
                         try:
-                            ws_records = sh.worksheet("records")
-                            total = len(st.session_state.cart)
-                            for i, item in enumerate(st.session_state.cart):
-                                status_text.text(f"處理中 {i+1}/{total}...")
-                                link = ""
-                                if item['file']:
-                                    link = upload_file_via_gas(item['file'])
+                            # 寫入時，重新取得最新的 sh 物件 (不使用快取)
+                            sh = get_sh(gc) 
+                            if sh:
+                                ws_records = sh.worksheet("records")
+                                total = len(st.session_state.cart)
+                                for i, item in enumerate(st.session_state.cart):
+                                    status_text.text(f"處理中 {i+1}/{total} (圖片上傳中)...")
+                                    
+                                    link = ""
+                                    if item['file']:
+                                        link = upload_file_via_gas(item['file'])
+                                    
+                                    ws_records.append_row([
+                                        str(hash(item['content'] + str(time.time()))),
+                                        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                        str(meeting_date),
+                                        st.session_state.user_info['dept'],
+                                        st.session_state.user_info['group'],
+                                        item['content'],
+                                        link
+                                    ])
+                                    progress_bar.progress((i+1)/total)
                                 
-                                ws_records.append_row([
-                                    str(hash(item['content'] + str(time.time()))),
-                                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                                    str(meeting_date),
-                                    st.session_state.user_info['dept'],
-                                    st.session_state.user_info['group'],
-                                    item['content'],
-                                    link
-                                ])
-                                progress_bar.progress((i+1)/total)
-                            st.success("成功！")
-                            st.session_state.cart = []
-                            time.sleep(2)
-                            st.rerun()
+                                st.success("✅ 成功！資料已更新。")
+                                st.session_state.cart = []
+                                # 關鍵：送出成功後，清除快取，這樣下次讀取才會是新的
+                                st.cache_data.clear()
+                                time.sleep(2)
+                                st.rerun()
+                            else:
+                                st.error("寫入失敗：無法連接試算表")
+                                
                         except Exception as e:
-                            st.error(f"寫入失敗: {e}")
+                            # 如果遇到 Quota 錯誤，提示使用者
+                            if "429" in str(e):
+                                st.error("流量過大 (API Quota)，請休息 1 分鐘後再試。")
+                            else:
+                                st.error(f"寫入失敗: {e}")
 
 if __name__ == "__main__":
     main()
