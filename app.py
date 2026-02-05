@@ -15,7 +15,7 @@ import time
 # 1. 設定區 (Configuration)
 # ====================
 # 【請填入您在 GAS 部署後產生的網址】(以 https://script.google.com/... 開頭)
-GAS_UPLOAD_URL = "請務必在此填入您的GAS網址"
+GAS_UPLOAD_URL = "https://script.google.com/macros/s/AKfycbzre2cPuoiie16hiFW1Dto1xFgnvPTqtM3O9u97Ja1qdWoGlSbZ7PEQ8X6rBh_tNpOB/exec"
 
 SCOPE = [
     "https://www.googleapis.com/auth/spreadsheets",
