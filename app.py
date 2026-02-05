@@ -88,6 +88,7 @@ def upload_file_via_gas(file_obj):
 
 def main():
     st.set_page_config(page_title="校務會議看板", layout="wide", page_icon="🏫")
+    st.error("【系統診斷】目前版本：v2.0 (GAS Relay Mode) - 若看到此行代表更新成功") # <--- 加入這一行
     
     gc = init_connection()
     if gc is None:
