@@ -1,6 +1,6 @@
-# Version: v2.1 (Clean Production)
+# Version: v2.2 (ID-Based Locking)
 # Author: CTO (Gemini)
-# Description: 正式版 - 透過 GAS 中繼站上傳檔案，並寫入 Google Sheets
+# Description: 改用 Sheet ID 強制鎖定試算表，排除檔名誤差
 
 import streamlit as st
 import pandas as pd
@@ -14,8 +14,12 @@ import time
 # ====================
 # 1. 設定區 (Configuration)
 # ====================
-# 【請填入您在 GAS 部署後產生的網址】(以 https://script.google.com/... 開頭)
+
+# 【請填入 GAS 網址】
 GAS_UPLOAD_URL = "https://script.google.com/macros/s/AKfycbzre2cPuoiie16hiFW1Dto1xFgnvPTqtM3O9u97Ja1qdWoGlSbZ7PEQ8X6rBh_tNpOB/exec"
+
+# 【請填入 Google Sheet ID】(網址 d/ 和 /edit 中間那串)
+SHEET_ID = "1bX4webOXnQ65dNtjAS7Iuo78gRB8GWBKvm03Vif72hM"
 
 SCOPE = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -29,11 +33,9 @@ SCOPE = [
 def init_connection():
     """連線到 Google Sheets"""
     creds = None
-    # 優先嘗試讀取 Streamlit Cloud 的 Secrets
     if "gcp_service_account" in st.secrets:
         creds_dict = st.secrets["gcp_service_account"]
         creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPE)
-    # 本機測試時讀取 JSON 檔案
     else:
         try:
             creds = Credentials.from_service_account_file("service_account.json", scopes=SCOPE)
@@ -43,10 +45,10 @@ def init_connection():
     return gspread.authorize(creds)
 
 def get_data(gc):
-    """讀取 Google Sheet 資料"""
+    """讀取 Google Sheet 資料 (使用 ID 鎖定)"""
     try:
-        # 請確認您的試算表名稱完全一致 (大小寫、空格)
-        sh = gc.open("School_Meeting_System")
+        # v2.2 修改：改用 ID 開啟，絕對精準
+        sh = gc.open_by_key(SHEET_ID)
         
         ws_config = sh.worksheet("config")
         df_config = pd.DataFrame(ws_config.get_all_records())
@@ -56,7 +58,8 @@ def get_data(gc):
         
         return sh, df_config, df_records
     except Exception as e:
-        # 回傳 None 代表連線失敗或找不到檔案
+        # 如果還是失敗，我們會把錯誤印出來
+        st.error(f"【嚴重錯誤】無法開啟試算表。錯誤訊息: {e}")
         return None, None, None
 
 def upload_file_via_gas(file_obj):
@@ -65,7 +68,6 @@ def upload_file_via_gas(file_obj):
         return ""
     
     try:
-        # 將檔案轉為 Base64 字串傳送
         file_content = file_obj.getvalue()
         base64_str = base64.b64encode(file_content).decode('utf-8')
         
@@ -75,7 +77,6 @@ def upload_file_via_gas(file_obj):
             "mimeType": file_obj.type
         }
         
-        # 發送 POST 請求給 GAS
         response = requests.post(GAS_UPLOAD_URL, json=payload)
         result = response.json()
         
@@ -96,19 +97,27 @@ def upload_file_via_gas(file_obj):
 def main():
     st.set_page_config(page_title="校務會議看板", layout="wide", page_icon="🏫")
     
-    # 1. 建立連線
+    # 診斷資訊：顯示機器人 Email (方便除錯)
+    if "gcp_service_account" in st.secrets:
+        bot_email = st.secrets["gcp_service_account"]["client_email"]
+        # st.caption(f"🔧 System Diagnosis: Bot Email is [{bot_email}]") 
+        # ↑ 如果連線成功，建議將上行註解掉，以免暴露資訊
+
     gc = init_connection()
     if gc is None:
-        st.error("❌ 系統連線失敗：請檢查 Secrets 設定或是 service_account.json 是否存在。")
+        st.error("❌ 系統連線失敗：Secrets 設定有誤。")
         return
 
-    # 2. 讀取資料
     sh, df_config, df_records = get_data(gc)
+    
+    # 如果 sh 是 None，代表 ID 錯誤或是機器人真的沒權限
     if sh is None:
-        st.error("❌ 找不到試算表：請確認 Google Sheet 名稱是否為 'School_Meeting_System'，且已將機器人 Email 加入共用編輯權限。")
+        st.warning(f"請再次確認：\n1. 您的 Google Sheet ID 是否正確填入程式碼？\n2. 是否已將機器人加入試算表共用？")
+        if "gcp_service_account" in st.secrets:
+            st.code(f"請複製此機器人 Email 加入共用：\n{st.secrets['gcp_service_account']['client_email']}")
         return
 
-    # 3. 初始化 Session State
+    # --- 以下邏輯不變 ---
     if 'logged_in' not in st.session_state:
         st.session_state.logged_in = False
     if 'user_info' not in st.session_state:
@@ -116,33 +125,25 @@ def main():
     if 'cart' not in st.session_state:
         st.session_state.cart = [] 
 
-    # --- 側邊欄：登入/登出 ---
     with st.sidebar:
         st.title("🏫 功能選單")
-        
         if not st.session_state.logged_in:
             st.subheader("使用者登入")
-            
-            # 防呆：如果資料庫是空的
             if df_config.empty:
-                st.warning("設定檔 (config) 為空，請先至 Google Sheet 建立帳號。")
+                st.warning("設定檔 (config) 為空。")
             else:
                 dept_list = df_config['department'].unique().tolist()
                 selected_dept = st.selectbox("選擇處室", dept_list)
-                
                 groups_in_dept = df_config[df_config['department'] == selected_dept]['group'].tolist()
                 selected_group = st.selectbox("選擇組別", groups_in_dept)
-                
                 password = st.text_input("密碼", type="password")
                 
                 if st.button("登入"):
-                    # 驗證邏輯
                     valid_user = df_config[
                         (df_config['department'] == selected_dept) & 
                         (df_config['group'] == selected_group) & 
                         (df_config['password'].astype(str) == str(password))
                     ]
-                    
                     if not valid_user.empty:
                         st.session_state.logged_in = True
                         st.session_state.user_info = {'dept': selected_dept, 'group': selected_group}
@@ -159,127 +160,96 @@ def main():
                 st.session_state.cart = []
                 st.rerun()
 
-    # --- 主畫面 ---
-    tab1, tab2 = st.tabs(["📋 會議紀錄看板", "📝 繕打報告 (需登入)"])
+    tab1, tab2 = st.tabs(["📋 看板", "📝 繕打"])
 
-    # === Tab 1: 看板 ===
     with tab1:
         st.header("每週會議紀錄彙整")
-        
         if not df_records.empty:
-            # 確保日期格式與排序
             df_records['meeting_date'] = pd.to_datetime(df_records['meeting_date']).dt.date
             all_dates = sorted(df_records['meeting_date'].unique(), reverse=True)
             selected_date = st.selectbox("選擇會議日期", all_dates)
-            
             st.divider()
             
-            # 顯示該日期的資料
             daily_records = df_records[df_records['meeting_date'] == selected_date]
-            
             if daily_records.empty:
-                 st.info("該日期尚無紀錄。")
+                st.info("該日期無紀錄")
             else:
-                # 依照處室分群
                 departments = daily_records['department'].unique()
                 for dept in departments:
                     st.subheader(f"📂 {dept}")
                     dept_data = daily_records[daily_records['department'] == dept]
-                    
                     for idx, row in dept_data.iterrows():
-                        # 顯示每一點報告
                         with st.expander(f"{row['group']} - {str(row['content'])[:20]}...", expanded=True):
                             st.markdown(f"**報告內容：**\n{row['content']}")
-                            
-                            # 顯示圖片 (如果有連結)
                             if row['image_url'] and str(row['image_url']).strip() != "":
                                 st.image(row['image_url'], caption="附件圖片", use_container_width=True)
                     st.write("---")
         else:
-            st.info("目前資料庫中沒有任何紀錄。")
+            st.info("尚無紀錄")
 
-    # === Tab 2: 繕打 ===
     with tab2:
         if not st.session_state.logged_in:
-            st.warning("請先由左側欄登入後才能繕打報告。")
+            st.warning("請先登入")
         else:
             st.header(f"新增報告 - {st.session_state.user_info['group']}")
-            
-            col_date, col_dummy = st.columns([1, 2])
-            with col_date:
+            col_d, _ = st.columns([1,2])
+            with col_d:
                 meeting_date = st.date_input("會議日期")
-            
             st.divider()
             
-            # 輸入區
             col1, col2 = st.columns([2, 1])
             with col1:
-                new_content = st.text_area("輸入報告事項 (單點)", height=120, placeholder="請輸入報告內容...")
+                new_content = st.text_area("輸入內容", height=120)
             with col2:
-                uploaded_file = st.file_uploader("上傳圖片 (支援 jpg, png)", type=['png', 'jpg', 'jpeg'])
+                uploaded_file = st.file_uploader("上傳圖片", type=['png', 'jpg', 'jpeg'])
             
-            # 加入暫存按鈕
-            if st.button("➕ 加入暫存清單"):
+            if st.button("➕ 加入暫存"):
                 if new_content:
                     st.session_state.cart.append({
                         'content': new_content,
                         'file': uploaded_file,
                         'file_name': uploaded_file.name if uploaded_file else "無附件"
                     })
-                    st.success("已加入暫存！")
-                else:
-                    st.error("內容不能為空")
-
-            # 顯示暫存區
+                    st.success("已加入")
+            
             if st.session_state.cart:
-                st.markdown("### 🛒 待提交清單 (預覽)")
+                st.markdown("### 🛒 暫存清單")
                 st.table(pd.DataFrame(st.session_state.cart)[['content', 'file_name']])
                 
-                col_clear, col_submit = st.columns([1, 4])
-                with col_clear:
-                    if st.button("🗑️ 清空暫存"):
+                col_c, col_s = st.columns([1, 4])
+                with col_c:
+                    if st.button("🗑️ 清空"):
                         st.session_state.cart = []
                         st.rerun()
-                
-                with col_submit:
-                    if st.button("🚀 確認送出所有報告", type="primary"):
+                with col_s:
+                    if st.button("🚀 確認送出", type="primary"):
                         progress_bar = st.progress(0)
                         status_text = st.empty()
-                        
                         try:
                             ws_records = sh.worksheet("records")
-                            total_items = len(st.session_state.cart)
-                            
+                            total = len(st.session_state.cart)
                             for i, item in enumerate(st.session_state.cart):
-                                status_text.text(f"正在處理第 {i+1}/{total_items} 筆 (圖片上傳中，請稍候)...")
-                                
-                                # 透過 GAS 上傳圖片
-                                file_link = ""
+                                status_text.text(f"處理中 {i+1}/{total}...")
+                                link = ""
                                 if item['file']:
-                                    file_link = upload_file_via_gas(item['file'])
+                                    link = upload_file_via_gas(item['file'])
                                 
-                                # 準備寫入資料
-                                new_row = [
-                                    str(hash(item['content'] + str(time.time()))), # UUID
-                                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),  # 提交時間
-                                    str(meeting_date),                             # 會議日期
-                                    st.session_state.user_info['dept'],            # 處室
-                                    st.session_state.user_info['group'],           # 組別
-                                    item['content'],                               # 內容
-                                    file_link                                      # 圖片連結
-                                ]
-                                
-                                ws_records.append_row(new_row)
-                                progress_bar.progress((i + 1) / total_items)
-                            
-                            status_text.text("處理完成！")
-                            st.success("✅ 所有報告已成功寫入資料庫！")
-                            st.session_state.cart = [] # 清空
+                                ws_records.append_row([
+                                    str(hash(item['content'] + str(time.time()))),
+                                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                    str(meeting_date),
+                                    st.session_state.user_info['dept'],
+                                    st.session_state.user_info['group'],
+                                    item['content'],
+                                    link
+                                ])
+                                progress_bar.progress((i+1)/total)
+                            st.success("成功！")
+                            st.session_state.cart = []
                             time.sleep(2)
                             st.rerun()
-                            
                         except Exception as e:
-                            st.error(f"寫入失敗：{e}")
+                            st.error(f"寫入失敗: {e}")
 
 if __name__ == "__main__":
     main()
